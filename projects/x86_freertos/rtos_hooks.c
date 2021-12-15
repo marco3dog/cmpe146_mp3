@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "FreeRTOS.h"
+#include "task.h"
+
 // Defined at FreeRTOSConfig.h
 void vAssertCalled(unsigned long ulLine, const char *const pcFileName) {
   printf("CRITICAL RTOS ASSERT: %s : %lu\n", pcFileName, ulLine);
@@ -40,4 +43,15 @@ void vApplicationIdleHook(void) {
   // We should sleep here for a few hundred nanoseconds otherwise this
   // FreeRTOS POSIX simulator will consume 100% host CPU core
   nanosleep((const struct timespec[]){{0, 100L * 1000}}, NULL);
+}
+
+// Copied from https://www.freertos.org/a00110.html, needed when #if (0 != configSUPPORT_STATIC_ALLOCATION)
+void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer,
+                                   uint32_t *pulIdleTaskStackSize) {
+  static StaticTask_t xIdleTaskTCB;
+  static StackType_t uxIdleTaskStack[configMINIMAL_STACK_SIZE];
+
+  *ppxIdleTaskTCBBuffer = &xIdleTaskTCB;            // memory for the idle task
+  *ppxIdleTaskStackBuffer = uxIdleTaskStack;        // stack memory for the idle task
+  *pulIdleTaskStackSize = configMINIMAL_STACK_SIZE; // stack memory size
 }

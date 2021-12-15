@@ -18,10 +18,7 @@ static void entry_point__rtos_trace_init_after_mounting_sd_card(void);
 void entry_point(void) {
   startup__initialize_ram();
   startup__initialize_fpu();
-  startup__initialize_interrupts();
-
   clock__initialize_system_clock_96mhz();
-  sys_time__init(clock__get_peripheral_clock_hz());
 
   /* RTOS trace is an optional component configured by FreeRTOSConfig.h
    * We need to initialize the trace early before using ANY RTOS API
@@ -29,8 +26,12 @@ void entry_point(void) {
    *  Notes:
    *  - We cannot use TRC_START here as the SD card is not initialized yet
    *  - This can be used even if the trace library is not enabled
+   *  - Initialize trace here so that the trace library APIs are accessible early
    */
   vTraceEnable(TRC_INIT);
+
+  startup__initialize_interrupts();
+  sys_time__init(clock__get_peripheral_clock_hz());
 
   // Peripherals init initializes UART and then we can print the crash report if applicable
   peripherals_init();

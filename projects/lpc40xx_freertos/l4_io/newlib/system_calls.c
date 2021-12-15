@@ -149,11 +149,16 @@ int _read(int file_descriptor, char *ptr, int len) {
   int bytes_read = 0;
 
   if (_isatty(file_descriptor)) {
-    // This is a little awkward but uart__polled_get() will not poll if RTOS is running with UART RX queue enabled
-    if (uart__polled_get(system_calls__uart_type, &ptr[0])) {
-      // We deliberately just read 1 char, and let the libc re-invoke _read() again as needed
-      ++bytes_read;
+    const bool rtos_is_running = taskSCHEDULER_RUNNING == xTaskGetSchedulerState();
+    const bool receive_queue_enabled = uart__is_receive_queue_initialized(system_calls__uart_type);
+    if (rtos_is_running && receive_queue_enabled) {
+      uart__get(system_calls__uart_type, &ptr[0], portMAX_DELAY);
+    } else {
+      uart__polled_get(system_calls__uart_type, &ptr[0]);
     }
+
+    // We deliberately just read 1 char, and let the libc re-invoke _read() again as needed
+    ++bytes_read;
   } else {
     system_calls__print_and_halt("ERROR: Call to _read() with an unsupported handle");
   }

@@ -59,9 +59,6 @@ static const lpc_peripheral_e uart_peripheral_ids[] = {LPC_PERIPHERAL__UART0, LP
  *
  ******************************************************************************/
 
-static bool uart__is_receive_queue_enabled(uart_e uart) { return (NULL != uarts[uart].queue_receive); }
-static bool uart__is_transmit_queue_enabled(uart_e uart) { return (NULL != uarts[uart].queue_transmit); }
-
 static void uart__wait_for_transmit_to_complete(lpc_uart *uart_regs) {
   const uint32_t transmitter_empty = (1 << 5);
   while (!(uart_regs->LSR & transmitter_empty)) {
@@ -196,7 +193,9 @@ bool uart__is_initialized(uart_e uart) {
   return lpc_peripheral__is_powered_on(uart_peripheral_ids[uart]) && (0 != uarts[uart].registers->LCR);
 }
 
-bool uart__is_transmit_queue_initialized(uart_e uart) { return uart__is_transmit_queue_enabled(uart); }
+bool uart__is_transmit_queue_initialized(uart_e uart) { return (NULL != uarts[uart].queue_transmit); }
+
+bool uart__is_receive_queue_initialized(uart_e uart) { return (NULL != uarts[uart].queue_receive); }
 
 bool uart__enable_queues(uart_e uart, QueueHandle_t queue_receive, QueueHandle_t queue_transmit) {
   bool status = false;
@@ -205,14 +204,14 @@ bool uart__enable_queues(uart_e uart, QueueHandle_t queue_receive, QueueHandle_t
   // We can only access UART registers after its power has been enabled
   if (uart__is_initialized(uart)) {
     // Ensure that the queues are not already enabled
-    if (!uart__is_receive_queue_enabled(uart) && NULL != queue_receive) {
+    if (!uart__is_receive_queue_initialized(uart) && NULL != queue_receive) {
       uart_type->queue_receive = queue_receive;
       const char name[] = {'U', '0' + (char)uart, 'R', 'X', 'Q', '\0'};
       vTraceSetQueueName(queue_receive, name);
       (void)name; // avoid warning if trace is disabled
     }
 
-    if (!uart__is_transmit_queue_enabled(uart) && NULL != queue_transmit) {
+    if (!uart__is_transmit_queue_initialized(uart) && NULL != queue_transmit) {
       uart_type->queue_transmit = queue_transmit;
       const char name[] = {'U', '0' + (char)uart, 'T', 'X', 'Q', '\0'};
       vTraceSetQueueName(queue_transmit, name);
@@ -220,7 +219,7 @@ bool uart__enable_queues(uart_e uart, QueueHandle_t queue_receive, QueueHandle_t
     }
 
     // Enable peripheral_id interrupt if all is well
-    status = uart__is_receive_queue_enabled(uart) && uart__is_transmit_queue_enabled(uart);
+    status = uart__is_receive_queue_initialized(uart) && uart__is_transmit_queue_initialized(uart);
     if (status) {
       uart__enable_receive_and_transmit_interrupts(uart);
     }
@@ -233,7 +232,7 @@ bool uart__polled_get(uart_e uart, char *input_byte) {
   bool status = false;
 
   const bool rtos_is_running = taskSCHEDULER_RUNNING == xTaskGetSchedulerState();
-  const bool queue_is_enabled = uart__is_receive_queue_enabled(uart);
+  const bool queue_is_enabled = uart__is_receive_queue_initialized(uart);
 
   if (uart__is_initialized(uart)) {
     /* If the RTOS is running and queues are enabled, then we will be unable to access the
@@ -281,7 +280,7 @@ bool uart__get(uart_e uart, char *input_byte, uint32_t timeout_ms) {
    * We do not desire to perform polling because that would involve time keeping
    * without an RTOS which increases the driver complexity.
    */
-  if (uart__is_receive_queue_enabled(uart) && rtos_is_running) {
+  if (uart__is_receive_queue_initialized(uart) && rtos_is_running) {
     status = xQueueReceive(uarts[uart].queue_receive, input_byte, RTOS_MS_TO_TICKS(timeout_ms));
   }
 
@@ -292,7 +291,7 @@ bool uart__put(uart_e uart, char output_byte, uint32_t timeout_ms) {
   bool status = false;
   const bool rtos_is_running = taskSCHEDULER_RUNNING == xTaskGetSchedulerState();
 
-  if (uart__is_transmit_queue_enabled(uart) && rtos_is_running) {
+  if (uart__is_transmit_queue_initialized(uart) && rtos_is_running) {
     // Deposit to the transmit queue for now
     status = xQueueSend(uarts[uart].queue_transmit, &output_byte, RTOS_MS_TO_TICKS(timeout_ms));
 

@@ -46,7 +46,7 @@
 #define configUSE_TASK_NOTIFICATIONS                      1
 
 /* Software timer related configuration options. */
-#define configUSE_TIMERS                                  1
+#define configUSE_TIMERS                                  0
 #define configTIMER_TASK_PRIORITY                         (configMAX_PRIORITIES - 1)
 #define configTIMER_QUEUE_LENGTH                          20
 #define configTIMER_TASK_STACK_DEPTH                      (configMINIMAL_STACK_SIZE * 2)
@@ -78,9 +78,17 @@ functions anyway. */
 #define INCLUDE_pcTaskGetTaskName                         1
 #define INCLUDE_eTaskGetState                             1
 #define INCLUDE_xSemaphoreGetMutexHolder                  1
-#define INCLUDE_xTimerPendFunctionCall                    1
 #define INCLUDE_xTaskAbortDelay                           1
 #define INCLUDE_xTaskGetHandle                            1
+#define INCLUDE_xTimerPendFunctionCall                    (configUSE_TIMERS)
+
+/* Dynamic allocation is discouraged, and users are encouraged to use 'static' based APIs
+ * such as using 'xQueueCreateStatic()' in place of 'xQueueCreate()'
+ *
+ * But this is enabled to provide convenience to students who use this project
+ */
+#define configSUPPORT_DYNAMIC_ALLOCATION        1
+#define configSUPPORT_STATIC_ALLOCATION         1
 
 /* It is a good idea to define configASSERT() while developing.  configASSERT()
 uses the same semantics as the standard C assert() macro. */
