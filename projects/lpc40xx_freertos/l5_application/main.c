@@ -1,111 +1,338 @@
 #include <stdio.h>
 
 #include "FreeRTOS.h"
+#include "adc.h"
+#include "errno.h"
+#include "event_groups.h"
+#include "ff.h"
+#include "gpio.h"
+#include "gpio_isr.h"
+#include "gpio_lab.h"
+#include "i2c.h"
+#include "lpc40xx.h"
+#include "lpc_peripherals.h"
+#include "mp3_lcd.h"
+#include "mp3_menu_system.h"
+#include "pwm1.h"
+#include "queue.h"
+#include "semphr.h"
+#include "song_list.h"
+#include "ssp0_mp3.h"
+#include "ssp2_lab.h"
 #include "task.h"
+#include "timers.h"
+#include "uart_lab.h"
+#include <string.h>
 
 #include "board_io.h"
 #include "common_macros.h"
 #include "periodic_scheduler.h"
 #include "sj2_cli.h"
+#include "sys_time.h"
 
-// 'static' to make these functions 'private' to this file
-static void create_blinky_tasks(void);
-static void create_uart_task(void);
-static void blink_task(void *params);
-static void uart_task(void *params);
+typedef char songname[32];
+
+QueueHandle_t Q_songname;
+QueueHandle_t Q_songdata;
+
+uint16_t volumes[8] = {(1991 * 7), (1991 * 6), (1991 * 5), (1991 * 4), (1991 * 3), (1991 * 2), 1991, 0x0000};
+size_t volume_level;
+uint64_t time_since_button_press;
+
+SemaphoreHandle_t song_number_change;
+SemaphoreHandle_t song_select;
+SemaphoreHandle_t volume_change_semaphore;
+SemaphoreHandle_t printing_to_screen_semaphore;
+SemaphoreHandle_t change_song_semaphore;
+SemaphoreHandle_t play_pause_semaphore;
+
+gpio_s switch_down;
+gpio_s switch_up;
+gpio_s switch_select;
+gpio_s switch_volume_up;
+gpio_s switch_volume_down;
+
+size_t song_number;
+
+bool currently_playing;
+bool now_playing_screen_flag;
+bool stop_playback;
+
+void mp3_player_task(void *p);
+void mp3_reader_task(void *p);
+void mp3_lcd_update_screen_task(void *p);
+void print_now_playing_task(void *p);
+void adjust_volume_task(void *p);
+
+void scroll_down_isr(void);
+void scroll_up_isr(void);
+void select_isr(void);
+void adjust_volume_up_isr(void);
+void adjust_volume_down_isr(void);
 
 int main(void) {
-  create_blinky_tasks();
-  create_uart_task();
+  sj2_cli__init();
+  sys_time__init(clock__get_peripheral_clock_hz());
 
-  // If you have the ESP32 wifi module soldered on the board, you can try uncommenting this code
-  // See esp32/README.md for more details
-  // uart3_init();                                                                     // Also include:  uart3_init.h
-  // xTaskCreate(esp32_tcp_hello_world_task, "uart3", 1000, NULL, PRIORITY_LOW, NULL); // Include esp32_task.h
+  now_playing_screen_flag = false;
+  currently_playing = false;
+  stop_playback = false;
+  song_number = 0;
+  volume_level = 3;
+  time_since_button_press = 0;
 
-  puts("Starting RTOS");
-  vTaskStartScheduler(); // This function never returns unless RTOS scheduler runs out of memory and fails
+  Q_songname = xQueueCreate(1, sizeof(songname));
+  Q_songdata = xQueueCreate(1, 512);
 
+  song_number_change = xSemaphoreCreateBinary();
+  song_select = xSemaphoreCreateBinary();
+  volume_change_semaphore = xSemaphoreCreateBinary();
+  change_song_semaphore = xSemaphoreCreateBinary();
+  printing_to_screen_semaphore = xSemaphoreCreateMutex();
+  play_pause_semaphore = xSemaphoreCreateBinary();
+
+  switch_down = gpio__construct_with_function(GPIO__PORT_0, 6, 0);
+  switch_up = gpio__construct_with_function(GPIO__PORT_0, 7, 0);
+  switch_select = gpio__construct_with_function(GPIO__PORT_0, 25, 0);
+  switch_volume_up = gpio__construct_with_function(GPIO__PORT_0, 11, 0);
+  switch_volume_down = gpio__construct_with_function(GPIO__PORT_0, 8, 0);
+
+  gpio__set_as_input(switch_down);
+  gpio__set_as_input(switch_up);
+  gpio__set_as_input(switch_select);
+  gpio__set_as_input(switch_volume_down);
+  gpio__set_as_input(switch_volume_up);
+
+  NVIC_EnableIRQ(GPIO_IRQn);
+  lpc_peripheral__enable_interrupt(LPC_PERIPHERAL__GPIO, gpio0__interrupt_dispatcher, "gpio_interrupt");
+  gpio0__attach_interrupt(6, GPIO_INTR__RISING_EDGE, scroll_down_isr);
+  gpio0__attach_interrupt(7, GPIO_INTR__RISING_EDGE, scroll_up_isr);
+  gpio0__attach_interrupt(25, GPIO_INTR__FALLING_EDGE, select_isr); // 15
+  gpio0__attach_interrupt(11, GPIO_INTR__FALLING_EDGE, adjust_volume_up_isr);
+  gpio0__attach_interrupt(8, GPIO_INTR__FALLING_EDGE, adjust_volume_down_isr);
+
+  ssp0_mp3_init();
+  song_list__populate();
+  main_menu_init();
+  printf("Number of songs: %d\n", song_list__get_item_count());
+  for (size_t i = 0; i < song_list__get_item_count(); i++) {
+    printf("Name: %s\n", song_list__get_name_for_item(i));
+  }
+  printf("CLOCKF: %x\n", read_sci_reg(SCI_CLOCKF));
+  printf("MODE: 0x%x\n", read_sci_reg(SCI_MODE));
+
+  xTaskCreate(mp3_lcd_update_screen_task, "lcd_task", 4096 / sizeof(void *), NULL, PRIORITY_HIGH, NULL);
+  xTaskCreate(mp3_reader_task, "reader", 4096 / sizeof(void *), NULL, PRIORITY_HIGH, NULL);
+  xTaskCreate(mp3_player_task, "player", 4096 / sizeof(void *), NULL, PRIORITY_MEDIUM, NULL);
+  xTaskCreate(print_now_playing_task, "now_playing", 4096 / sizeof(void *), NULL, PRIORITY_HIGH, NULL);
+  xTaskCreate(adjust_volume_task, "adjust_volume", 4096 / sizeof(void *), NULL, PRIORITY_HIGH, NULL);
+
+  vTaskStartScheduler();
   return 0;
 }
 
-static void create_blinky_tasks(void) {
-  /**
-   * Use '#if (1)' if you wish to observe how two tasks can blink LEDs
-   * Use '#if (0)' if you wish to use the 'periodic_scheduler.h' that will spawn 4 periodic tasks, one for each LED
-   */
-#if (1)
-  // These variables should not go out of scope because the 'blink_task' will reference this memory
-  static gpio_s led0, led1;
-
-  // If you wish to avoid malloc, use xTaskCreateStatic() in place of xTaskCreate()
-  static StackType_t led0_task_stack[512 / sizeof(StackType_t)];
-  static StackType_t led1_task_stack[512 / sizeof(StackType_t)];
-  static StaticTask_t led0_task_struct;
-  static StaticTask_t led1_task_struct;
-
-  led0 = board_io__get_led0();
-  led1 = board_io__get_led1();
-
-  xTaskCreateStatic(blink_task, "led0", ARRAY_SIZE(led0_task_stack), (void *)&led0, PRIORITY_LOW, led0_task_stack,
-                    &led0_task_struct);
-  xTaskCreateStatic(blink_task, "led1", ARRAY_SIZE(led1_task_stack), (void *)&led1, PRIORITY_LOW, led1_task_stack,
-                    &led1_task_struct);
-#else
-  periodic_scheduler__initialize();
-  UNUSED(blink_task);
-#endif
+void send_song_data_from_SD(songname name, char *bytes_512) {
+  const char *filename = name;
+  FIL file;
+  UINT bytes_read = 0;
+  FRESULT result = f_open(&file, filename, FA_READ);
+  if (FR_OK == result) {
+    FSIZE_t file_size = f_size(&file);
+    char artist_name[512] = "";
+    UINT bytes_read_2 = 0;
+    f_lseek(&file, file_size - 512);
+    f_read(&file, &artist_name[0], 512, &bytes_read_2);
+    f_lseek(&file, 0);
+    printf("Artist: %s\n", artist_name);
+    printf("file size: %ld\n", file_size);
+    currently_playing = true;
+    while (!f_eof(&file)) {
+      if (stop_playback) {
+        f_close(&file);
+        mp3_reset();
+        write_sci_reg(SCI_MODE, SCI_MODE_INIT);
+        write_sci_reg(SCI_CLOCKF, SCI_CLOCKF_INIT);
+        break;
+      }
+      if (FR_OK == f_read(&file, &bytes_512[0], 512, &bytes_read)) {
+        xQueueSend(Q_songdata, &bytes_512[0], portMAX_DELAY);
+      } else {
+        printf("ERROR: Failed to read data to file\n");
+      }
+    }
+    currently_playing = false;
+    f_close(&file);
+  } else {
+    printf("ERROR: Failed to open: %s\n", filename);
+    printf("Error: %d\n", result);
+  }
 }
+void mp3_reader_task(void *p) {
+  songname name;
+  char bytes_512[512];
 
-static void create_uart_task(void) {
-  // It is advised to either run the uart_task, or the SJ2 command-line (CLI), but not both
-  // Change '#if (0)' to '#if (1)' and vice versa to try it out
-#if (0)
-  // printf() takes more stack space, size this tasks' stack higher
-  xTaskCreate(uart_task, "uart", (512U * 8) / sizeof(void *), NULL, PRIORITY_LOW, NULL);
-#else
-  sj2_cli__init();
-  UNUSED(uart_task); // uart_task is un-used in if we are doing cli init()
-#endif
-}
-
-static void blink_task(void *params) {
-  const gpio_s led = *((gpio_s *)params); // Parameter was input while calling xTaskCreate()
-
-  // Warning: This task starts with very minimal stack, so do not use printf() API here to avoid stack overflow
-  while (true) {
-    gpio__toggle(led);
-    vTaskDelay(500);
+  while (1) {
+    xQueueReceive(Q_songname, &name[0], portMAX_DELAY);
+    vTaskDelay(5);
+    write_sci_reg(SCI_MODE, SCI_MODE_INIT);
+    send_song_data_from_SD(name, bytes_512);
   }
 }
 
-// This sends periodic messages over printf() which uses system_calls.c to send them to UART0
-static void uart_task(void *params) {
-  TickType_t previous_tick = 0;
-  TickType_t ticks = 0;
+void mp3_player_task(void *p) {
+  char bytes_512[512];
+  uint16_t i = 0;
+  while (1) {
+    xQueueReceive(Q_songdata, &bytes_512[0], portMAX_DELAY);
+    i = 0;
+    while (i < sizeof(bytes_512)) {
+      if (xSemaphoreTake(change_song_semaphore, 0)) {
+        stop_playback = true;
+        break;
+      }
+      while (!can_take_data()) {
+        ;
+      }
+      xdcs_cs();
+      ssp0_mp3_exchange_byte(bytes_512[i]);
+      xdcs_ds();
+      i++;
+    }
+  }
+}
 
-  while (true) {
-    // This loop will repeat at precise task delay, even if the logic below takes variable amount of ticks
-    vTaskDelayUntil(&previous_tick, 2000);
+void mp3_lcd_update_screen_task(void *p) {
+  while (1) {
+    if (xSemaphoreTake(song_number_change, portMAX_DELAY)) {
+      vTaskDelay(20);
+      xSemaphoreTake(printing_to_screen_semaphore, portMAX_DELAY);
+      now_playing_screen_flag = false;
+      vTaskDelay(20);
+      print_to_screen_with_arrow(song_list__get_name_for_item(song_number % song_list__get_item_count()),
+                                 RESET_TO_HOME);
+      print_to_screen(song_list__get_name_for_item((song_number + 1) % song_list__get_item_count()), START_NEW_LINE);
+      print_to_screen(song_list__get_name_for_item((song_number + 2) % song_list__get_item_count()), START_NEW_LINE);
+      print_to_screen(song_list__get_name_for_item((song_number + 3) % song_list__get_item_count()), START_NEW_LINE);
+      xSemaphoreGive(printing_to_screen_semaphore);
+    }
+  }
+}
 
-    /* Calls to fprintf(stderr, ...) uses polled UART driver, so this entire output will be fully
-     * sent out before this function returns. See system_calls.c for actual implementation.
-     *
-     * Use this style print for:
-     *  - Interrupts because you cannot use printf() inside an ISR
-     *    This is because regular printf() leads down to xQueueSend() that might block
-     *    but you cannot block inside an ISR hence the system might crash
-     *  - During debugging in case system crashes before all output of printf() is sent
-     */
-    ticks = xTaskGetTickCount();
-    fprintf(stderr, "%u: This is a polled version of printf used for debugging ... finished in", (unsigned)ticks);
-    fprintf(stderr, " %lu ticks\n", (xTaskGetTickCount() - ticks));
+void print_now_playing_task(void *p) {
+  while (1) {
+    xSemaphoreTake(song_select, portMAX_DELAY);
+    vTaskDelay(500);
+    xSemaphoreTake(printing_to_screen_semaphore, portMAX_DELAY);
+    now_playing_screen_flag = true;
+    clear_screen();
+    print_to_screen("Now playing:", RESET_TO_HOME);
+    print_to_screen(song_list__get_name_for_item(song_number), START_NEW_LINE);
+    print_to_screen("Artist: asfdasdf", START_NEW_LINE); // PLACEHOLDER
+    print_to_position("Vol:", 3, 0);
+    xSemaphoreGive(printing_to_screen_semaphore);
+    xSemaphoreGive(volume_change_semaphore);
+  }
+}
 
-    /* This deposits data to an outgoing queue and doesn't block the CPU
-     * Data will be sent later, but this function would return earlier
-     */
-    ticks = xTaskGetTickCount();
-    printf("This is a more efficient printf ... finished in");
-    printf(" %lu ticks\n\n", (xTaskGetTickCount() - ticks));
+void print_volume_level_chars(void) {
+  switch (volume_level) {
+  case 0:
+    print_to_position("Muted", 3, 4);
+    break;
+  case 1:
+    print_to_position("=      ", 3, 4);
+    break;
+  case 2:
+    print_to_position("==     ", 3, 4);
+    break;
+  case 3:
+    print_to_position("===    ", 3, 4);
+    break;
+  case 4:
+    print_to_position("====   ", 3, 4);
+    break;
+  case 5:
+    print_to_position("=====  ", 3, 4);
+    break;
+  case 6:
+    print_to_position("====== ", 3, 4);
+    break;
+  case 7:
+    print_to_position("=======", 3, 4);
+    break;
+  default:;
+  }
+}
+
+void adjust_volume_task(void *p) {
+  while (1) {
+    xSemaphoreTake(volume_change_semaphore, portMAX_DELAY);
+    write_sci_reg(SCI_VOL, volumes[volume_level]);
+    if (now_playing_screen_flag) {
+      xSemaphoreTake(printing_to_screen_semaphore, portMAX_DELAY);
+      print_volume_level_chars();
+      xSemaphoreGive(printing_to_screen_semaphore);
+    }
+  }
+}
+
+void scroll_down_isr(void) {
+  if (sys_time__get_uptime_ms() - time_since_button_press >= 250) {
+    song_number++;
+    if (song_number == song_list__get_item_count())
+      song_number = 0;
+    xSemaphoreGiveFromISR(song_number_change, NULL);
+    time_since_button_press = sys_time__get_uptime_ms();
+  }
+}
+
+void scroll_up_isr(void) {
+  if (sys_time__get_uptime_ms() - time_since_button_press >= 250) {
+    if (song_number != 0) {
+      song_number--;
+    } else {
+      song_number = (song_list__get_item_count() - 1);
+    }
+    xSemaphoreGiveFromISR(song_number_change, NULL);
+    time_since_button_press = sys_time__get_uptime_ms();
+  }
+}
+
+void select_isr(void) {
+  if (currently_playing && !now_playing_screen_flag) {
+    xSemaphoreGiveFromISR(song_select, NULL);
+    xSemaphoreGiveFromISR(change_song_semaphore, NULL);
+  } else if (now_playing_screen_flag) {
+    currently_playing = false;
+    xSemaphoreGiveFromISR(play_pause_semaphore, NULL);
+
+  } else if (!currently_playing) {
+    xSemaphoreGiveFromISR(song_select, NULL);
+  }
+
+  xQueueSendFromISR(Q_songname, song_list__get_name_for_item(song_number % song_list__get_item_count()), 0);
+}
+
+void adjust_volume_up_isr(void) {
+  if (sys_time__get_uptime_ms() - time_since_button_press >= 250) {
+    if (volume_level >= 7) {
+      ;
+    } else {
+      volume_level++;
+      xSemaphoreGiveFromISR(volume_change_semaphore, NULL);
+      time_since_button_press = sys_time__get_uptime_ms();
+    }
+  }
+}
+
+void adjust_volume_down_isr(void) {
+  if (sys_time__get_uptime_ms() - time_since_button_press >= 250) {
+    if (volume_level <= 0) {
+      ;
+    } else {
+      volume_level--;
+      xSemaphoreGiveFromISR(volume_change_semaphore, NULL);
+      time_since_button_press = sys_time__get_uptime_ms();
+    }
   }
 }

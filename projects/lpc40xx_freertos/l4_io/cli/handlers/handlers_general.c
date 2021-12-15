@@ -1,6 +1,8 @@
 #include "cli_handlers.h"
 
 #include "FreeRTOS.h"
+#include "queue.h"
+#include "stdio.h"
 #include "task.h"
 
 #include "uart_printf.h"
@@ -37,6 +39,32 @@ app_cli_status_e cli__task_list(app_cli__argument_t argument, sl_string_s user_i
   sl_string_s output_string = user_input_minus_command_name;
   cli__task_list_print(output_string, cli_output);
 
+  return APP_CLI_STATUS__SUCCESS;
+}
+
+app_cli_status_e cli__suspend_task(app_cli__argument_t argument, sl_string_s user_input_minus_command_name,
+                                   app_cli__print_string_function cli_output) {
+  sl_string_s s = user_input_minus_command_name;
+  TaskHandle_t task_name = xTaskGetHandle(s.cstring);
+  vTaskSuspend(task_name);
+  return APP_CLI_STATUS__SUCCESS;
+}
+
+app_cli_status_e cli__resume_task(app_cli__argument_t argument, sl_string_s user_input_minus_command_name,
+                                  app_cli__print_string_function cli_output) {
+  sl_string_s s = user_input_minus_command_name;
+  TaskHandle_t task_name = xTaskGetHandle(s.cstring);
+  vTaskResume(task_name);
+  return APP_CLI_STATUS__SUCCESS;
+}
+
+extern QueueHandle_t Q_songname;
+typedef char songname[32];
+
+app_cli_status_e cli__play_mp3(app_cli__argument_t argument, sl_string_s user_input_minus_command_name,
+                               app_cli__print_string_function cli_output) {
+  xQueueSendFromISR(Q_songname, user_input_minus_command_name.cstring, portMAX_DELAY);
+  printf("Sent %s over to the Q_songname\n", user_input_minus_command_name.cstring);
   return APP_CLI_STATUS__SUCCESS;
 }
 
